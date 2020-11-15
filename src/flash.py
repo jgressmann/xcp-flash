@@ -107,7 +107,8 @@ class XCPFlash:
             Connection mode for the xcp-protocol. Only set if a custom mode is needed.
         """
 
-        channel = kwargs.get("channel", None)
+        interface = kwargs.get("interface", "")
+        channel = kwargs.get("channel", "")
         self._extended_id = kwargs.get("extended_id", False)
 
         ag = kwargs.get("ag", 0)
@@ -118,15 +119,13 @@ class XCPFlash:
             self._ag = ag
 
         self._reader = BufferedReader()
-        if platform.system() == "Windows":
-            from can.interfaces.usb2can import Usb2canBus
-            self._bus = Usb2canBus(channel=channel)
-        elif platform.system() == "Linux":
-            from can.interfaces.socketcan import SocketcanBus
-            self._bus = SocketcanBus(channel=channel)
+
+        from can.interface import Bus
+        if None is not interface and "" != interface:
+            self._bus = Bus(channel=channel, interface=interface)
         else:
-            from can.interface import Bus
             self._bus = Bus(channel=channel)
+
         self._bus.set_filters(
             [{"can_id": rx_id, "can_mask": rx_id + 0x100, "extended": self._extended_id}])
         self._notifier = Notifier(self._bus, [self._reader])
@@ -534,6 +533,16 @@ class XCPFlash:
 
 
 if __name__ == "__main__":
+    # select a sensible default value for the interface/channel
+    default_interface = ""
+    default_channel = ""
+    if platform.system() == "Windows":
+        default_interface = "usb2can"
+        default_channel = "ED000200"
+    elif platform.system() == "Linux":
+        default_interface = "socketcan"
+        default_channel = "can0"
+
     parser = argparse.ArgumentParser()
     parser.add_argument("firmware", type=str, help=".s19 firmware file")
     parser.add_argument("--txid", dest="transmission_id", type=str,
@@ -542,12 +551,14 @@ if __name__ == "__main__":
                         help="Message ID for receiving (HEX)")
     parser.add_argument("--mode", dest="conn_mode", type=str, required=False, default="00",
                         help="Connection mode for xcp-session")
-    parser.add_argument("--channel", dest="channel", type=str, required=False, default="ED000200",
-                        help="Channel for USB2can adapter on Windows")
+    parser.add_argument("--interface", dest="interface", type=str, required=False, default=default_interface,
+                        help="Interface to use (e.g 'usb2can', 'socketcan')")
+    parser.add_argument("--channel", dest="channel", type=str, required=False, default=default_channel,
+                        help="Channel of the interface (Linux: can0, Windows: ED000200)")
     parser.add_argument("--extended", dest="extended", type=int, required=False, default=-1,
                         help="rx/tx use extended identifiers (CAN 2.0B)")
     parser.add_argument("--ag", dest="ag", type=int, required=False, default=0,
-                        help="Override address granularity reported by device Values (4, 2, 1).")
+                        help="Override address granularity reported by device (4, 2, 1).")
     args = parser.parse_args()
 
     f = bincopy.BinFile(args.firmware)
@@ -565,7 +576,7 @@ if __name__ == "__main__":
 
     xcp_flash = XCPFlash(
         txid, rxid, int(args.conn_mode, 16),
-        channel=args.channel, extended_id=ext, ag=args.ag)
+        interface=args.interface, channel=args.channel, extended_id=ext, ag=args.ag)
     xcp_flash(f.minimum_address, f.as_binary())
 
     sys.exit(0)
