@@ -109,6 +109,8 @@ class XCPFlash:
 
         interface = kwargs.get("interface", "")
         channel = kwargs.get("channel", "")
+        bus_kwargs = kwargs.get("bus_kwargs", {})
+
         self._extended_id = kwargs.get("extended_id", False)
 
         ag = kwargs.get("ag", 0)
@@ -122,9 +124,9 @@ class XCPFlash:
 
         from can.interface import Bus
         if None is not interface and "" != interface:
-            self._bus = Bus(channel=channel, interface=interface)
+            self._bus = Bus(channel=channel, interface=interface, **bus_kwargs)
         else:
-            self._bus = Bus(channel=channel)
+            self._bus = Bus(channel=channel, **bus_kwargs)
 
         self._bus.set_filters(
             [{"can_id": rx_id, "can_mask": rx_id + 0x100, "extended": self._extended_id}])
@@ -559,6 +561,8 @@ if __name__ == "__main__":
                         help="rx/tx use extended identifiers (CAN 2.0B)")
     parser.add_argument("--ag", dest="ag", type=int, required=False, default=0,
                         help="Override address granularity reported by device (4, 2, 1).")
+    parser.add_argument("--bus-kwargs", dest="bus_kwargs", type=str, required=False, default="",
+                        help="Extra key=value,key=value arguments to python-can Bus.")
     args = parser.parse_args()
 
     f = bincopy.BinFile(args.firmware)
@@ -574,9 +578,14 @@ if __name__ == "__main__":
     else:
         ext = True
 
+    bus_kwargs = {}
+    for pair in args.bus_kwargs.split(","):
+        k, v = pair.split('=')
+        bus_kwargs[str(k)] = str(v)
+
     xcp_flash = XCPFlash(
         txid, rxid, int(args.conn_mode, 16),
-        interface=args.interface, channel=args.channel, extended_id=ext, ag=args.ag)
+        interface=args.interface, channel=args.channel, extended_id=ext, ag=args.ag, bus_kwargs=bus_kwargs)
     xcp_flash(f.minimum_address, f.as_binary())
 
     sys.exit(0)
