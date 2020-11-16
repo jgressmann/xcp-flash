@@ -2,6 +2,7 @@
 
 from enum import Enum
 import argparse
+import logging
 import platform
 import sys
 import time
@@ -9,11 +10,29 @@ import time
 from can import Message, Notifier, BufferedReader
 import bincopy
 
+# spec = http://read.pudn.com/downloads192/doc/comm/903802/XCP%20-Part%202-%20Protocol%20Layer%20Specification%20-1.0.pdf
+
+logger = logging.getLogger("xcp-flash")
+logger.setLevel(logging.INFO)
+logger.addHandler(logging.StreamHandler(sys.stderr))
+
+def xcp_timeout_ms(no: int):
+    if no == 7:
+        return 200
+
+    if no == 6:
+        return 5
+
+    return 25
+
+def xcp_timeout_s(no: int):
+    return 1e-3 * xcp_timeout_ms(no)
 
 class XCPCommands(Enum):
     """Some codes for relevant xcp commands"""
     CONNECT = 0xFF
     DISCONNECT = 0xFE
+    SYNCH = 0xFC
     GET_COMM_MODE_INFO = 0xFB
     GET_ID = 0xFA
     SET_MTA = 0xF6
@@ -80,21 +99,7 @@ class XCPFlash:
     BYTE_ORDER_LE = 0
     BYTE_ORDER_BE = 1
 
-    _reader = None
-    _bus = None
-    _notifier = None
-    _tx_id = 0
-    _rx_id = 0
-    _conn_mode = 0
-    _ag = 1
-    _ag_override = False
-    _byte_order = BYTE_ORDER_LE
-    _queue_size = 0
-    _max_block_size = 0
-    _initial_comm_mode = None
-    _extended_id = False
-    _master_block_mode_supported = False
-    _min_separation_time_us = 0
+
 
     def __init__(self, tx_id: int, rx_id: int, connection_mode: int=0, **kwargs):
         """Sets up a CAN bus instance with a filter and a notifier.
@@ -106,6 +111,21 @@ class XCPFlash:
         :param connection_mode:
             Connection mode for the xcp-protocol. Only set if a custom mode is needed.
         """
+
+        self._tx_id = tx_id
+        self._rx_id = rx_id
+        self._ag = 1
+        self._ag_override = False
+        self._byte_order = XCPFlash.BYTE_ORDER_LE
+        self._queue_size = 0
+        self._max_block_size = 0
+        self._conn_mode = connection_mode
+        self._initial_comm_mode = connection_mode
+        self._extended_id = False
+        self._master_block_mode_supported = False
+        self._master_block_mode_supported_override = False
+        self._min_separation_time_us = 0
+        self._base_delay_ms = max(kwargs.get("base_delay_ms", 0), 0)
 
         interface = kwargs.get("interface", "")
         channel = kwargs.get("channel", "")
@@ -120,7 +140,12 @@ class XCPFlash:
             self._ag_override = True
             self._ag = ag
 
-        self._reader = BufferedReader()
+        mbm = kwargs.get("master_block_mode", -1)
+        if mbm < 0:
+            self._master_block_mode_supported_override = False
+        else:
+            self._master_block_mode_supported_override = True
+            self._master_block_mode_supported = mbm != 0
 
         from can.interface import Bus
         if None is not interface and "" != interface:
@@ -129,12 +154,8 @@ class XCPFlash:
             self._bus = Bus(channel=channel, **bus_kwargs)
 
         self._bus.set_filters(
-            [{"can_id": rx_id, "can_mask": rx_id + 0x100, "extended": self._extended_id}])
-        self._notifier = Notifier(self._bus, [self._reader])
-        self._tx_id = tx_id
-        self._rx_id = rx_id
-        self._conn_mode = connection_mode
-        self._initial_comm_mode = connection_mode
+            [{"can_id": rx_id, "can_mask": rx_id, "extended": self._extended_id}])
+
 
     @staticmethod
     def sys_byte_order():
@@ -185,69 +206,32 @@ class XCPFlash:
         if iteration == total:
             print()
 
-    def send_can_msg(self, msg, wait=True, timeout=30):
-        """Send a message via can
 
-        Send a message over the can-network and may wait for a given timeout for a response.
 
-        :param msg:
-            Message to send
-        :param wait:
-            True if the program should be waiting for a response, False otherwise
-        :param timeout:
-            Timeout for waiting for a response
-        :return:
-            The response if wait is set to True, nothing otherwise
-        """
+    def _drain_bus(self):
+        rx_msgs = []
 
-        self._bus.send(msg)
-        if wait:
-            try:
-                return self.wait_for_response(timeout, msg)
-            except ConnectionAbortedError as err:
-                raise err
-
-    def wait_for_response(self, timeout, msg=None):
-        """Waiting for a response
-
-        :param timeout:
-            Time to wait
-        :param msg:
-            The message which was send. Set this only if a retry should be made in case of a timeout.
-        :return:
-            The response from the device
-        :raises: ConnectionAbortedError
-            if the response is an error
-        """
-
-        tries = 1
         while True:
-            if tries == 5:
-                raise ConnectionAbortedError("Timeout")
-            received = self._reader.get_message(timeout)
-            if received is None and msg is not None:
-                self.send_can_msg(msg, False)
-                tries += 1
-                continue
+            received = self._bus.recv(0)
+
             if received is None:
-                continue
-            if received.arbitration_id == self._rx_id and received.data[0] == XCPResponses.SUCCESS.value:
-                return received
-            elif received.arbitration_id == self._rx_id and received.data[0] == XCPResponses.ERROR.value:
-                raise ConnectionAbortedError(received.data[1])
-            elif msg is not None:
-                self.send_can_msg(msg, False)
+                break
+
+            if received.arbitration_id == self._rx_id:
+                rx_msgs.append(received)
+
+        return rx_msgs
 
     def _wait_for_rx(self, timeout_s: float):
-        time_left_ns = int(timeout_s * 1e9)
+        time_left = timeout_s
 
-        while time_left_ns >= 0:
+        while time_left >= 0:
+            start = time.perf_counter()
+            # received = self._reader.get_message(time_left)
+            received = self._bus.recv(time_left)
+            stop = time.perf_counter()
 
-            start = time.perf_counter_ns()
-            received = self._reader.get_message(time_left_ns * 1e-9)
-            stop = time.perf_counter_ns()
-
-            time_left_ns -= stop - start
+            time_left -= stop - start
 
             if received is not None and received.arbitration_id == self._rx_id:
                 return received
@@ -255,140 +239,9 @@ class XCPFlash:
 
         return None
 
-    def execute(self, command, **kwargs):
-        """Execute a command
+    def _timeout_s(self, no: int):
+        return 1e-3 * (self._base_delay_ms + xcp_timeout_ms(no))
 
-        Builds the can-message to execute the given command and sends it to the device.
-
-        :param command:
-            The xcp-command to be executed
-        :param kwargs:
-            Needed arguments for the command.
-                :command SET_MTA:
-                    'addr_ext' and 'addr'
-                :command PROGRAM_CLEAR:
-                    'range'
-                :command PROGRAM:
-                    'size' and 'data'
-        :return: response of the command if waited for
-        """
-
-        msg = Message(arbitration_id=self._tx_id,
-                      is_extended_id=self._extended_id, data=bytes(8))
-        msg.data[0] = command.value
-        if command == XCPCommands.CONNECT:
-            msg.data[1] = self._conn_mode
-            response = None
-
-            while True:
-                self._bus.send(msg)
-                received = self._reader.get_message(0.1) # 100 [ms]
-                if None is received:
-                    pass
-
-                elif received.arbitration_id == self._rx_id:
-                    if received.data[0] == XCPResponses.SUCCESS.value:
-                        response = received
-                        break
-
-                    raise ConnectionAbortedError(received.data[1])
-                else:
-                    pass # some other message
-
-
-            self._max_data = response.data[4] << 8
-            self._max_data += response.data[5]
-            self._byte_order = response.data[2] & 1
-
-            if not self._ag_override:
-                self._ag = 1 << ((response.data[2] >> 1) & 0x3)
-
-            if self._byte_order == self.sys_byte_order():
-                self._swap16 = lambda x: x & 0xffff
-                self._swap32 = lambda x: x & 0xffffffff
-            else:
-                self._swap16 = self.swap16
-                self._swap32 = self.swap32
-
-            return response
-
-        if command == XCPCommands.GET_COMM_MODE_INFO:
-            done = False
-            while not done:
-                self._bus.send(msg)
-                received = self._reader.get_message()
-                if None is received:
-                    break
-                elif received.arbitration_id == self._rx_id:
-                    if received.data[0] == XCPResponses.SUCCESS.value:
-                        #Position                 Type           Description
-                        # 0                       BYTE           Packet ID: 0xFF
-                        # 1                       BYTE           Reserved
-                        # 2                       BYTE           COMM_MODE_OPTIONAL
-                        # 3                       BYTE           Reserved
-                        # 4                       BYTE           MAX_BS
-                        # 5                       BYTE           MIN_ST
-                        # 6                       BYTE           QUEUE_SIZE
-                        # 7                       BYTE           XCP Driver Version Number
-                        self._master_block_mode_supported = (received.data[2] & 1) == 1
-                        self._max_block_size = received.data[4]
-                        self._min_separation_time_us = 100 * received.data[5]
-
-                    break
-                else:
-                    pass # some other message
-
-        if command == XCPCommands.DISCONNECT:
-            # return self.send_can_msg(msg)
-            self._bus.send(msg)
-        if command == XCPCommands.SET_MTA:
-            addr = self._swap32(kwargs['addr'])
-            msg.data[3] = kwargs.get('addr_ext', 0)
-            msg.data[4] = addr & 0xff
-            msg.data[5] = (addr >> 8) & 0xff
-            msg.data[6] = (addr >> 16) & 0xff
-            msg.data[7] = (addr >> 24) & 0xff
-
-            return self.send_can_msg(msg)
-        if command == XCPCommands.PROGRAM_START:
-            # 0 BYTE Packet ID: 0xFF
-            # 1 BYTE Reserved
-            # 2 BYTE COMM_MODE_PGM
-            # 3 BYTE MAX_CTO_PGM [BYTES] Maximum CTO size for PGM
-            # 4 BYTE MAX_BS_PGM
-            # 5 BYTE MIN_ST_PGM
-            # 6 BYTE QUEUE_SIZE_PGM
-
-            response = self.send_can_msg(msg)
-
-            prog_comm_mode = response.data[2]
-            # if prog_comm_mode != self._conn_mode:
-            #     if self._initial_comm_mode != self._conn_mode:
-            #         # prevent a ring around the rosy situation
-            #         raise ConnectionError(f'communication mode already switch once from {self._initial_comm_mode} to {self._conn_mode} with new request for {prog_comm_mode}')
-
-            #     self._conn_mode = prog_comm_mode
-            #     # fix me: do this automatically
-            #     raise ConnectionError(f'device requires comm mode 0x{prog_comm_mode:02x} for programming')
-
-            self._max_block_size = response.data[4]
-            self._max_cto = response.data[3]
-            if self._max_cto == 0 or self._max_cto % self._ag:
-                raise ConnectionError(f'inconsistent device params: MAX_CTO_PGM={self._max_cto}, ADDRESS_GRANULARITY={self._ag}')
-
-            self._queue_size = response.data[6]
-            self._master_block_mode_supported = (response.data[2] & 1) == 1
-            self._min_separation_time_us = 100 * response.data[5]
-
-            return response
-        if command == XCPCommands.PROGRAM_CLEAR:
-            # range = int(self._swap32(kwargs['range']) / self._ag)
-            range = self._swap32(kwargs['range'])
-            msg.data[4] = range & 0xff
-            msg.data[5] = (range >> 8) & 0xff
-            msg.data[6] = (range >> 16) & 0xff
-            msg.data[7] = (range >> 24) & 0xff
-            return self.send_can_msg(msg)
 
     def program(self, data):
         """Program the device
@@ -398,7 +251,6 @@ class XCPFlash:
         :param data:
             the firmware as byte-array
         """
-        print("flashing new firmware...")
 
         # 0 BYTE Command Code = 0xD0
         # 1 Number of data elements [AG] [1..(MAX_CTO-2)/AG]
@@ -419,6 +271,7 @@ class XCPFlash:
         data_offset_start = 4 if self._ag == 4 else 2
         msg = Message(arbitration_id=self._tx_id, is_extended_id=self._extended_id, data=bytes(8))
 
+        count = 0
 
         if self._master_block_mode_supported:
             max_bytes_per_block = self._max_block_size * bytes_per_message
@@ -430,6 +283,7 @@ class XCPFlash:
                 else:
                     bytes_left_in_block = min(max_bytes_per_block, len(data) - offset)
                     msg.data[0] = XCPCommands.PROGRAM.value
+                    this_block_bytes = bytes_left_in_block
 
                 msg_bytes = min(bytes_left_in_block, bytes_per_message)
                 msg.data[1] = bytes_left_in_block
@@ -439,22 +293,45 @@ class XCPFlash:
                 msg.data[data_offset_start:data_offset_start + msg_bytes] = data[offset:offset + msg_bytes]
                 offset += msg_bytes
 
+                rx_msgs = self._drain_bus()
+                for response in rx_msgs:
+                    if response.data[0] == XCPResponses.ERROR.value:
+                        if response.data[1] == XCPErrors.ERR_CMD_BUSY.value:
+                            timeout_s = self._timeout_s(7)
+                            count = 0
+                        else:
+                            raise ConnectionError(f'PROGRAM_START failed with error code: 0x{response.data[1]:02x}')
+
+
                 self._bus.send(msg)
+
+                if 0 == bytes_left_in_block:
+                    response = self._wait_for_rx(self._timeout_s(5))
+                    if None is response:
+                        offset -= this_block_bytes
+                        if count >= 3:
+                            raise ConnectionError(f'PROGRAM_NEXT failed timeout')
+                        else:
+                            self._sync_or_die()
+
+                            count += 1
+                        continue
+
+
+                    elif response.data[0] == XCPResponses.ERROR.value:
+                        if response.data[1] == XCPErrors.ERR_CMD_BUSY.value:
+                            timeout_s = self._timeout_s(7)
+                            continue
+                        else:
+                            raise ConnectionError(f'PROGRAM_START failed with error code: 0x{response.data[1]:02x}')
+
 
                 # wait
                 if self._min_separation_time_us > 0:
                     time.sleep(self._min_separation_time_us * 1e-6)
 
-                if 0 == bytes_left_in_block:
-                    response = self._wait_for_rx(1)
-
-                    if None is response:
-                        raise ConnectionError('timeout')
-
-                    if response.data[0] != XCPResponses.SUCCESS.value:
-                        raise ConnectionAbortedError(response.data[1])
-
         else:
+            raise NotImplementedError('PROGRAM path not implemented')
             msg.data[0] = XCPCommands.PROGRAM.value
             msg.data[1] = data_elements_per_message
             steps = int(len(data) / bytes_per_message)
@@ -464,40 +341,272 @@ class XCPFlash:
                 offset += bytes_per_message
                 self.send_can_msg(msg)
 
-        # PROGRAM_RESET is optional, send it and hope for the best
-        msg.data[0] = XCPCommands.PROGRAM_RESET.value
+        # # PROGRAM_RESET is optional, send it and hope for the best
+        # msg.data[0] = XCPCommands.PROGRAM_RESET.value
+        # self._bus.send(msg)
+
+    def _sync_or_die(self):
+        msg = Message(arbitration_id=self._tx_id,
+                      is_extended_id=self._extended_id, data=bytes(8))
+
+
+        msg.data[0] = XCPCommands.SYNCH.value
+        self._drain_bus()
         self._bus.send(msg)
+        response = self._wait_for_rx(self._timeout_s(7))
+        if None is response:
+            raise ConnectionError("timeout SYNCH")
+
+        if response.data[0] == XCPResponses.ERROR.value:
+            if response.data[1] != XCPErrors.ERR_CMD_SYNCH.value:
+                raise ConnectionAbortedError(response.data[1])
 
 
-    def clear(self, start_addr, length):
-        """Clear the memory of the device
 
-        Erase all contents of a given range in the device memory.
 
-        :param start_addr:
-            Start address of the range
-        :param length:
-            Length of the range
-        """
-        print("erasing device (this may take several minutes)...")
-        self.execute(XCPCommands.PROGRAM_START)
-        self.execute(XCPCommands.SET_MTA, addr=start_addr)
-        self.execute(XCPCommands.PROGRAM_CLEAR, range=length)
-        # self.execute(XCPCommands.SET_MTA, addr=start_addr)
+
+    def program_start(self):
+        msg = Message(arbitration_id=self._tx_id,
+                      is_extended_id=self._extended_id, data=bytes(8))
+
+        msg.data[0] = XCPCommands.PROGRAM_START.value
+        timeout_s = self._timeout_s(1)
+        count = 0
+
+        while True:
+
+            self._drain_bus()
+            self._bus.send(msg)
+            response = self._wait_for_rx(timeout_s)
+
+            if None is response:
+                if count >= 3:
+                    raise ConnectionError(f'PROGRAM_START failed timeout')
+                else:
+                    self._sync_or_die()
+
+                    count += 1
+                continue
+
+            if response.data[0] == XCPResponses.ERROR.value:
+                if response.data[1] == XCPErrors.ERR_CMD_BUSY.value:
+                    timeout_s = self._timeout_s(7)
+                    count = 0
+                    continue
+                else:
+                    raise ConnectionError(f'PROGRAM_START failed with error code: 0x{response.data[1]:02x}')
+
+            break
+
+        prog_comm_mode = response.data[2]
+        # if prog_comm_mode != self._conn_mode:
+        #     if self._initial_comm_mode != self._conn_mode:
+        #         # prevent a ring around the rosy situation
+        #         raise ConnectionError(f'communication mode already switch once from {self._initial_comm_mode} to {self._conn_mode} with new request for {prog_comm_mode}')
+
+        #     self._conn_mode = prog_comm_mode
+        #     # fix me: do this automatically
+        #     raise ConnectionError(f'device requires comm mode 0x{prog_comm_mode:02x} for programming')
+
+        self._max_block_size = response.data[4]
+        self._max_cto = response.data[3]
+        if self._max_cto == 0 or self._max_cto % self._ag:
+            raise ConnectionError(f'inconsistent device params: MAX_CTO_PGM={self._max_cto}, ADDRESS_GRANULARITY={self._ag}')
+
+        self._queue_size = response.data[6]
+
+        self._min_separation_time_us = 100 * response.data[5]
+        if not self._master_block_mode_supported_override:
+            self._master_block_mode_supported = (response.data[2] & 1) == 1
+
+
+
+
+    def set_mta(self, addr: int, addr_ext: int = 0):
+        msg = Message(arbitration_id=self._tx_id,
+                      is_extended_id=self._extended_id, data=bytes(8))
+
+        msg.data[0] = XCPCommands.SET_MTA.value
+
+        addr = self._swap32(addr)
+        msg.data[3] = addr_ext
+        msg.data[4] = addr & 0xff
+        msg.data[5] = (addr >> 8) & 0xff
+        msg.data[6] = (addr >> 16) & 0xff
+        msg.data[7] = (addr >> 24) & 0xff
+
+        timeout_s = self._timeout_s(1)
+        count = 0
+
+        while True:
+
+            self._drain_bus()
+            self._bus.send(msg)
+            response = self._wait_for_rx(timeout_s)
+
+            if None is response:
+                if count >= 3:
+                    raise ConnectionError(f'SET_MTA failed timeout')
+                else:
+                    self._sync_or_die()
+
+                    count += 1
+                continue
+
+            if response.data[0] == XCPResponses.ERROR.value:
+                if response.data[1] == XCPErrors.ERR_CMD_BUSY.value:
+                    timeout_s = self._timeout_s(7)
+                    count = 0
+                    continue
+                if response.data[1] == XCPErrors.ERR_PGM_ACTIVE.value:
+                    timeout_s = self._timeout_s(7)
+                    continue
+                else:
+                    raise ConnectionError(f'SET_MTA failed with error code: 0x{response.data[1]:02x}')
+
+            break
+
+
+    def program_clear(self, range: int):
+        msg = Message(arbitration_id=self._tx_id,
+                      is_extended_id=self._extended_id, data=bytes(8))
+
+        msg.data[0] = XCPCommands.PROGRAM_CLEAR.value
+
+        range = self._swap32(range)
+        msg.data[1] = 0 # absolute address
+        msg.data[2] = 0 # reserved
+        msg.data[3] = 0 # reserved
+        msg.data[4] = range & 0xff
+        msg.data[5] = (range >> 8) & 0xff
+        msg.data[6] = (range >> 16) & 0xff
+        msg.data[7] = (range >> 24) & 0xff
+
+        timeout_s = self._timeout_s(1)
+        count = 0
+
+        while True:
+
+            self._drain_bus()
+            self._bus.send(msg)
+            response = self._wait_for_rx(timeout_s)
+
+            if None is response:
+                if count >= 3:
+                    raise ConnectionError(f'PROGRAM_CLEAR failed timeout')
+                else:
+                    self._sync_or_die()
+
+                    count += 1
+                continue
+
+            if response.data[0] == XCPResponses.ERROR.value:
+                if response.data[0] == XCPErrors.ERR_CMD_BUSY.value:
+                    timeout_s = self._timeout_s(7)
+                    count = 0
+                    continue
+                else:
+                    raise ConnectionError(f'PROGRAM_CLEAR failed with error code: 0x{response.data[1]:02x}')
+
+            break
+
+    def program_reset(self):
+        msg = Message(arbitration_id=self._tx_id,
+                      is_extended_id=self._extended_id, data=bytes(8))
+        msg.data[0] = XCPCommands.PROGRAM_RESET.value
+
+
+        timeout_s = self._timeout_s(5)
+        count = 0
+
+        while True:
+
+            self._drain_bus()
+            self._bus.send(msg)
+            response = self._wait_for_rx(timeout_s)
+
+            if None is response:
+                if count >= 3:
+                    raise ConnectionError(f'PROGRAM_CLEAR failed timeout')
+                else:
+                    self._sync_or_die()
+
+                    count += 1
+                continue
+
+            if response.data[0] == XCPResponses.ERROR.value:
+                if response.data[0] == XCPErrors.ERR_CMD_BUSY.value:
+                    timeout_s = self._timeout_s(7)
+                    count = 0
+                    continue
+                if response.data[0] == XCPErrors.ERR_PGM_ACTIVE.value:
+                    timeout_s = self._timeout_s(7)
+                    continue
+                if response.data[0] == XCPErrors.ERR_CMD_UNKNOWN.value:
+                    break
+                else:
+                    raise ConnectionError(f'PROGRAM_CLEAR failed with error code: 0x{response.data[1]:02x}')
+
+            break
 
     def connect(self):
         """Connect to the device
         """
-        print("connecting...")
-        response = self.execute(XCPCommands.CONNECT)
-        if not response.data[1] & 0b00010000:
+
+        msg = Message(arbitration_id=self._tx_id,
+                      is_extended_id=self._extended_id, data=bytes(8))
+        msg.data[0] = XCPCommands.CONNECT.value
+        msg.data[1] = self._conn_mode
+          # spec, p138
+        if self._conn_mode == 0:
+            timeout_s = xcp_timeout_s(1) # some bootloader require fast startup
+        else:
+            timeout_s = self._timeout_s(7)
+
+        while True:
+            self._drain_bus()
+            self._bus.send(msg)
+            response = self._wait_for_rx(timeout_s)
+
+            if None is response:
+                continue
+
+            if response.data[0] == XCPResponses.ERROR.value:
+                raise ConnectionAbortedError(response.data[1])
+
+            break
+
+        self._pgm = (response.data[1] & 0b00010000) != 0
+        self._stm = (response.data[1] & 0b00001000) != 0
+        self._daq = (response.data[1] & 0b00000100) != 0
+        self._cal_pag = (response.data[1] & 0b00000001) != 0
+
+        if not self._pgm:
             raise ConnectionError(
                 "Flash programming not supported by the connected device")
 
+
+        self._max_data = response.data[4] << 8
+        self._max_data += response.data[5]
+        self._byte_order = response.data[2] & 1
+
+        if not self._ag_override:
+            self._ag = 1 << ((response.data[2] >> 1) & 0x3)
+
+        if self._byte_order == self.sys_byte_order():
+            self._swap16 = lambda x: x & 0xffff
+            self._swap32 = lambda x: x & 0xffffffff
+        else:
+            self._swap16 = self.swap16
+            self._swap32 = self.swap32
+
+
+
+
     def disconnect(self):
         """Disconnect from the device"""
-        print("disconnecting..")
-        self.execute(XCPCommands.DISCONNECT)
+        logger.info("disconnecting..")
+        # self.execute(XCPCommands.DISCONNECT)
 
     def __call__(self, start_addr, data):
         """Flash the device
@@ -511,39 +620,54 @@ class XCPFlash:
         """
 
         try:
+            logger.info("connecting...")
             self.connect()
-            #self.execute(XCPCommands.GET_COMM_MODE_INFO)
-            self.clear(start_addr, len(data))
+            logger.info("connected")
+            logger.info("start programming")
+            self.program_start()
+            logger.info(f"set MTA to {start_addr:08x}")
+            self.set_mta(start_addr)
+            logger.info(f"clear range {len(data):08x}")
+            self.program_clear(len(data))
+            logger.info(f"program data")
             self.program(data)
+            logger.info(f"reset")
+            self.program_reset()
         except ConnectionAbortedError as err:
             if err.args[0] == "Timeout":
-                print("\nConnection aborted: Timeout")
+                logger.error("\nConnection aborted: Timeout")
             else:
-                print("\nConnection aborted: {}".format(
-                    XCPErrors.error_messages[err.args[0]]))
+                logging.error("\nConnection aborted: {}".format(
+                    logger.error_messages[err.args[0]]))
         except ConnectionError as err:
-            print("\nConnection error: {}".format(err))
+            logger.error("\nConnection error: {}".format(err))
         finally:
             try:
                 self.disconnect()
             except ConnectionAbortedError as err:
-                if err.args[0] == "Timeout":
-                    print("\nConnection aborted: Timeout")
-                else:
-                    print("\nConnection aborted: {}".format(
-                        XCPErrors.error_messages[err.args[0]]))
+                # if err.args[0] == "Timeout":
+                #     #print("\nConnection aborted: Timeout")
+                # else:
+                #     print("\nConnection aborted: {}".format(
+                #         XCPErrors.error_messages[err.args[0]]))
+                pass
 
 
 if __name__ == "__main__":
     # select a sensible default value for the interface/channel
     default_interface = ""
     default_channel = ""
+    bus_kwargs = {}
     if platform.system() == "Windows":
         default_interface = "usb2can"
         default_channel = "ED000200"
     elif platform.system() == "Linux":
         default_interface = "socketcan"
         default_channel = "can0"
+        bus_kwargs = {
+            "fd": True,
+            "receive_own_messages": False
+        }
 
     parser = argparse.ArgumentParser()
     parser.add_argument("firmware", type=str, help=".s19 firmware file")
@@ -561,8 +685,12 @@ if __name__ == "__main__":
                         help="rx/tx use extended identifiers (CAN 2.0B)")
     parser.add_argument("--ag", dest="ag", type=int, required=False, default=0,
                         help="Override address granularity reported by device (4, 2, 1).")
-    parser.add_argument("--bus-kwargs", dest="bus_kwargs", type=str, required=False, default="",
+    parser.add_argument("--mbm", dest="master_block_mode", type=int, required=False, default=-1,
+                        help="Override master block mode support (0, 1).")
+    parser.add_argument("--bus-kwargs", dest="bus_kwargs", metavar="K=V, ...", type=str, required=False, default="",
                         help="Extra key=value,key=value arguments to python-can Bus.")
+    parser.add_argument("--base-delay-ms", dest="base_delay_ms", metavar="MS", type=int, required=False, default=9,
+                        help="Base delay to add to all XCP waits.")
     args = parser.parse_args()
 
     f = bincopy.BinFile(args.firmware)
@@ -578,14 +706,32 @@ if __name__ == "__main__":
     else:
         ext = True
 
-    bus_kwargs = {}
-    for pair in args.bus_kwargs.split(","):
-        k, v = pair.split('=')
-        bus_kwargs[str(k)] = str(v)
+    if len(args.bus_kwargs):
+        for pair in args.bus_kwargs.split(","):
+            if not len(pair):
+                logger.warn(f"empty key/value pair in {args.bus_kwargs}")
+                continue
+
+            index = pair.find("=")
+            if index == -1:
+                logger.warn(f"invalid key value pair '{pair}'")
+                continue
+
+            k, v = pair.split('=')
+            bus_kwargs[str(k)] = str(v)
 
     xcp_flash = XCPFlash(
         txid, rxid, int(args.conn_mode, 16),
-        interface=args.interface, channel=args.channel, extended_id=ext, ag=args.ag, bus_kwargs=bus_kwargs)
-    xcp_flash(f.minimum_address, f.as_binary())
+        interface=args.interface,
+        channel=args.channel,
+        extended_id=ext,
+        ag=args.ag,
+        master_block_mode=args.master_block_mode,
+        bus_kwargs=bus_kwargs,
+        base_delay_ms=args.base_delay_ms)
+    try:
+        xcp_flash(f.minimum_address, f.as_binary())
+    except Exception as e:
+        logger.exception(e)
 
     sys.exit(0)
