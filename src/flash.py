@@ -415,7 +415,7 @@ class XCPFlash:
 
         self._queue_size = response.data[6]
 
-        self._min_separation_time_us = 100 * response.data[5]
+        self._min_separation_time_us = 100 * max(1, response.data[5])
         if not self._master_block_mode_supported_override:
             self._master_block_mode_supported = (response.data[2] & 1) == 1
 
@@ -633,6 +633,8 @@ class XCPFlash:
             self.program(data)
             logger.info(f"reset")
             self.program_reset()
+            logger.info(f"disconnect")
+            self.disconnect()
         except ConnectionAbortedError as err:
             if err.args[0] == "Timeout":
                 logger.error("\nConnection aborted: Timeout")
@@ -641,16 +643,8 @@ class XCPFlash:
                     logger.error_messages[err.args[0]]))
         except ConnectionError as err:
             logger.error("\nConnection error: {}".format(err))
-        finally:
-            try:
-                self.disconnect()
-            except ConnectionAbortedError as err:
-                # if err.args[0] == "Timeout":
-                #     #print("\nConnection aborted: Timeout")
-                # else:
-                #     print("\nConnection aborted: {}".format(
-                #         XCPErrors.error_messages[err.args[0]]))
-                pass
+        except OSError as err:
+            logger.error(err)
 
 
 if __name__ == "__main__":
