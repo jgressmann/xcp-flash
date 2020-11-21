@@ -7,7 +7,7 @@ import platform
 import sys
 import time
 
-from can import Message, Notifier, BufferedReader
+from can import Message, Notifier, BufferedReader, CanError
 import bincopy
 
 # spec = http://read.pudn.com/downloads192/doc/comm/903802/XCP%20-Part%202-%20Protocol%20Layer%20Specification%20-1.0.pdf
@@ -15,6 +15,20 @@ import bincopy
 logger = logging.getLogger("xcp-flash")
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stderr))
+
+class LinuxErrors(Enum):
+    """Linux error codes
+
+    See /usr/include/asm-generic/errno.h
+        /usr/include/asm-generic/errno-base.h
+
+    for values.
+    """
+    ENOBUFS = 105 # No buffer space available
+
+XCP_HOST_IS_LINUX = platform.system() == "Linux"
+XCP_HOST_IS_WINDOWS = platform.system() == "Windows"
+
 
 def xcp_timeout_ms(no: int):
     if no == 7:
@@ -227,7 +241,6 @@ class XCPFlash:
 
         while time_left >= 0:
             start = time.perf_counter()
-            # received = self._reader.get_message(time_left)
             received = self._bus.recv(time_left)
             stop = time.perf_counter()
 
@@ -241,6 +254,22 @@ class XCPFlash:
 
     def _timeout_s(self, no: int):
         return 1e-3 * (self._base_delay_ms + xcp_timeout_ms(no))
+
+    @staticmethod
+    def _is_can_device_tx_queue_full(e: CanError) -> bool:
+        if XCP_HOST_IS_LINUX:
+            return XCPFlash._is_linux_enobufs(e)
+
+        return False
+
+    @staticmethod
+    def _is_linux_enobufs(e: CanError) -> bool:
+        # Unfortunately, CanError doesn't pass the error code the base
+        # so we can't check the errno attribute
+        #
+        # Failed to transmit: [Errno 105] No buffer space available
+        return e.args[0].find(str(LinuxErrors.ENOBUFS.value)) >= 0
+
 
 
     def program(self, data):
@@ -296,14 +325,28 @@ class XCPFlash:
                 rx_msgs = self._drain_bus()
                 for response in rx_msgs:
                     if response.data[0] == XCPResponses.ERROR.value:
-                        if response.data[1] == XCPErrors.ERR_CMD_BUSY.value:
+                        if response.data[1] == XCPErrors.ERR_CMD_BUSY:
                             timeout_s = self._timeout_s(7)
                             count = 0
                         else:
-                            raise ConnectionError(f'PROGRAM_START failed with error code: 0x{response.data[1]:02x}')
+                            message = 'fix me'
+                            if XCPErrors.ERR_SEQUENCE == response.data[1]:
+                                message = 'invalid sequence error'
+                            else:
+                                message = f'0x{response.data[1]:02x}'
+
+                            raise ConnectionError(f'{"PROGRAM" if msg.data[0] == XCPCommands.PROGRAM.value else "PROGRAM_NEXT"} failed with {message} (0x{response.data[1]:02x})')
 
 
-                self._bus.send(msg)
+                while True:
+                    try:
+                        self._bus.send(msg)
+                        break
+                    except CanError as e:
+                        if XCPFlash._is_can_device_tx_queue_full(e):
+                            time.sleep(self._timeout_s(1))
+                        else:
+                            raise e
 
                 if 0 == bytes_left_in_block:
                     response = self._wait_for_rx(self._timeout_s(5))
@@ -319,11 +362,11 @@ class XCPFlash:
 
 
                     elif response.data[0] == XCPResponses.ERROR.value:
-                        if response.data[1] == XCPErrors.ERR_CMD_BUSY.value:
+                        if response.data[1] == XCPErrors.ERR_CMD_BUSY:
                             timeout_s = self._timeout_s(7)
                             continue
                         else:
-                            raise ConnectionError(f'PROGRAM_START failed with error code: 0x{response.data[1]:02x}')
+                            raise ConnectionError(f'PROGRAM failed with error code: 0x{response.data[1]:02x}')
 
 
                 # wait
@@ -341,9 +384,6 @@ class XCPFlash:
                 offset += bytes_per_message
                 self.send_can_msg(msg)
 
-        # # PROGRAM_RESET is optional, send it and hope for the best
-        # msg.data[0] = XCPCommands.PROGRAM_RESET.value
-        # self._bus.send(msg)
 
     def _sync_or_die(self):
         msg = Message(arbitration_id=self._tx_id,
@@ -358,7 +398,7 @@ class XCPFlash:
             raise ConnectionError("timeout SYNCH")
 
         if response.data[0] == XCPResponses.ERROR.value:
-            if response.data[1] != XCPErrors.ERR_CMD_SYNCH.value:
+            if response.data[1] != XCPErrors.ERR_CMD_SYNCH:
                 raise ConnectionAbortedError(response.data[1])
 
 
@@ -389,7 +429,7 @@ class XCPFlash:
                 continue
 
             if response.data[0] == XCPResponses.ERROR.value:
-                if response.data[1] == XCPErrors.ERR_CMD_BUSY.value:
+                if response.data[1] == XCPErrors.ERR_CMD_BUSY:
                     timeout_s = self._timeout_s(7)
                     count = 0
                     continue
@@ -414,11 +454,10 @@ class XCPFlash:
             raise ConnectionError(f'inconsistent device params: MAX_CTO_PGM={self._max_cto}, ADDRESS_GRANULARITY={self._ag}')
 
         self._queue_size = response.data[6]
+        self._min_separation_time_us = 100 * response.data[5]
 
-        self._min_separation_time_us = 100 * max(1, response.data[5])
         if not self._master_block_mode_supported_override:
             self._master_block_mode_supported = (response.data[2] & 1) == 1
-
 
 
 
@@ -454,11 +493,11 @@ class XCPFlash:
                 continue
 
             if response.data[0] == XCPResponses.ERROR.value:
-                if response.data[1] == XCPErrors.ERR_CMD_BUSY.value:
+                if response.data[1] == XCPErrors.ERR_CMD_BUSY:
                     timeout_s = self._timeout_s(7)
                     count = 0
                     continue
-                if response.data[1] == XCPErrors.ERR_PGM_ACTIVE.value:
+                if response.data[1] == XCPErrors.ERR_PGM_ACTIVE:
                     timeout_s = self._timeout_s(7)
                     continue
                 else:
@@ -501,7 +540,7 @@ class XCPFlash:
                 continue
 
             if response.data[0] == XCPResponses.ERROR.value:
-                if response.data[0] == XCPErrors.ERR_CMD_BUSY.value:
+                if response.data[0] == XCPErrors.ERR_CMD_BUSY:
                     timeout_s = self._timeout_s(7)
                     count = 0
                     continue
@@ -535,14 +574,14 @@ class XCPFlash:
                 continue
 
             if response.data[0] == XCPResponses.ERROR.value:
-                if response.data[0] == XCPErrors.ERR_CMD_BUSY.value:
+                if response.data[0] == XCPErrors.ERR_CMD_BUSY:
                     timeout_s = self._timeout_s(7)
                     count = 0
                     continue
-                if response.data[0] == XCPErrors.ERR_PGM_ACTIVE.value:
+                if response.data[0] == XCPErrors.ERR_PGM_ACTIVE:
                     timeout_s = self._timeout_s(7)
                     continue
-                if response.data[0] == XCPErrors.ERR_CMD_UNKNOWN.value:
+                if response.data[0] == XCPErrors.ERR_CMD_UNKNOWN:
                     break
                 else:
                     raise ConnectionError(f'PROGRAM_CLEAR failed with error code: 0x{response.data[1]:02x}')
@@ -550,13 +589,13 @@ class XCPFlash:
             break
 
     def connect(self):
-        """Connect to the device
-        """
+        """Connect to the device"""
 
         msg = Message(arbitration_id=self._tx_id,
                       is_extended_id=self._extended_id, data=bytes(8))
         msg.data[0] = XCPCommands.CONNECT.value
         msg.data[1] = self._conn_mode
+
           # spec, p138
         if self._conn_mode == 0:
             timeout_s = xcp_timeout_s(1) # some bootloader require fast startup
@@ -565,8 +604,17 @@ class XCPFlash:
 
         while True:
             self._drain_bus()
-            self._bus.send(msg)
-            response = self._wait_for_rx(timeout_s)
+
+            try:
+                self._bus.send(msg)
+                response = self._wait_for_rx(timeout_s)
+
+            except CanError as e:
+                if not XCPFlash._is_can_device_tx_queue_full(e):
+                    raise e
+
+                response = None
+                time.sleep(self._timeout_s(7))
 
             if None is response:
                 continue
@@ -603,10 +651,51 @@ class XCPFlash:
 
 
 
-    def disconnect(self):
+    def disconnect(self, ignore_timeout: bool):
         """Disconnect from the device"""
-        logger.info("disconnecting..")
-        # self.execute(XCPCommands.DISCONNECT)
+
+        msg = Message(arbitration_id=self._tx_id,
+                      is_extended_id=self._extended_id, data=bytes(8))
+        msg.data[0] = XCPCommands.DISCONNECT.value
+
+
+        timeout_s = self._timeout_s(1)
+        count = 0
+
+        while True:
+
+            self._drain_bus()
+            self._bus.send(msg)
+            response = self._wait_for_rx(timeout_s)
+
+            if None is response:
+                if ignore_timeout:
+                    break
+
+                if count >= 3:
+                    raise ConnectionError(f'PROGRAM_CLEAR failed timeout')
+                else:
+                    self._sync_or_die()
+
+                    count += 1
+                continue
+
+            if response.data[0] == XCPResponses.ERROR.value:
+                if response.data[0] == XCPErrors.ERR_CMD_BUSY:
+                    timeout_s = self._timeout_s(7)
+                    count = 0
+                    continue
+                if response.data[0] == XCPErrors.ERR_PGM_ACTIVE:
+                    timeout_s = self._timeout_s(7)
+                    count = 0
+                    continue
+                if response.data[0] == XCPErrors.ERR_CMD_UNKNOWN:
+                    break
+                else:
+                    raise ConnectionError(f'PROGRAM_CLEAR failed with error code: 0x{response.data[1]:02x}')
+
+            break
+
 
     def __call__(self, start_addr, data):
         """Flash the device
@@ -623,7 +712,7 @@ class XCPFlash:
             logger.info("connecting...")
             self.connect()
             logger.info("connected")
-            logger.info("start programming")
+            logger.info("start of programming")
             self.program_start()
             logger.info(f"set MTA to {start_addr:08x}")
             self.set_mta(start_addr)
@@ -634,7 +723,7 @@ class XCPFlash:
             logger.info(f"reset")
             self.program_reset()
             logger.info(f"disconnect")
-            self.disconnect()
+            self.disconnect(True)
         except ConnectionAbortedError as err:
             if err.args[0] == "Timeout":
                 logger.error("\nConnection aborted: Timeout")
@@ -652,10 +741,10 @@ if __name__ == "__main__":
     default_interface = ""
     default_channel = ""
     bus_kwargs = {}
-    if platform.system() == "Windows":
+    if XCP_HOST_IS_WINDOWS:
         default_interface = "usb2can"
         default_channel = "ED000200"
-    elif platform.system() == "Linux":
+    elif XCP_HOST_IS_LINUX:
         default_interface = "socketcan"
         default_channel = "can0"
         bus_kwargs = {
