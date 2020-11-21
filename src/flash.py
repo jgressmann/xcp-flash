@@ -12,6 +12,9 @@ import bincopy
 
 # spec = http://read.pudn.com/downloads192/doc/comm/903802/XCP%20-Part%202-%20Protocol%20Layer%20Specification%20-1.0.pdf
 
+version_info = (0, 1, 0)
+version = '.'.join(str(c) for c in version_info)
+
 logger = logging.getLogger("xcp-flash")
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stderr))
@@ -774,6 +777,7 @@ if __name__ == "__main__":
                         help="Extra key=value,key=value arguments to python-can Bus.")
     parser.add_argument("--base-delay-ms", dest="base_delay_ms", metavar="MS", type=int, required=False, default=9,
                         help="Base delay to add to all XCP waits.")
+    parser.add_argument('--version', action='version', version='%(prog)s {}'.format(version), help='show the version number and exit')
     args = parser.parse_args()
 
     f = bincopy.BinFile(args.firmware)
