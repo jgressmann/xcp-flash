@@ -51,7 +51,22 @@ For flashing a firmware file `firmware.s32` execute
 bin/xcp-flash --txid 7C7 --rxid 7C8 firmware.s32
 ```
 
+#### USB2CAN
+
 On Windows USB2CAN adapters need an additional channel/serialnumber:
 ```
 bin/xcp-flash --txid 7C7 --rxid 7C8 --channel ED000200 firmware.s32
 ```
+
+#### [Vector](https://www.vector.com/) hardware
+
+To flash using Vector's CAN devices follow the instructions layed out
+[here](https://python-can.readthedocs.io/en/master/interfaces/vector.html) to set up an _application_.
+
+Then, to flash, run:
+
+```
+bin/xcp-flash --txid 7C7 --rxid 7C8 --channel 0 --interface vector --bus-kwargs app_name=<your app name> firmware.s32
+```
+
+Note this command uses logical channel index 0.
