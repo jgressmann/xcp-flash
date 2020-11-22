@@ -6,8 +6,8 @@
 
 
 from enum import Enum
-import argparse
 import logging
+from math import ceil
 import platform
 import sys
 import time
@@ -226,7 +226,7 @@ class XCPFlash:
         sys.stdout.write('\r{} |{}| {}% {}'.format(
             prefix, bar, percent, suffix))
         if iteration == total:
-            print()
+            sys.stdout.write('\n')
 
 
 
@@ -273,7 +273,7 @@ class XCPFlash:
     @staticmethod
     def _is_linux_enobufs(e: CanError) -> bool:
         # Unfortunately, CanError doesn't pass the error code the base
-        # so we can't check the errno attribute
+        # so we can't check the errno attribute :/
         #
         # Failed to transmit: [Errno 105] No buffer space available
         return e.args[0].find(str(LinuxErrors.ENOBUFS.value)) >= 0
@@ -312,6 +312,8 @@ class XCPFlash:
 
         if self._master_block_mode_supported:
             max_bytes_per_block = self._max_block_size * bytes_per_message
+            block_count = int(ceil(len(data) / max_bytes_per_block))
+            iteration = 0
             bytes_left_in_block = 0
 
             while offset < len(data):
@@ -321,6 +323,9 @@ class XCPFlash:
                     bytes_left_in_block = min(max_bytes_per_block, len(data) - offset)
                     msg.data[0] = XCPCommands.PROGRAM.value
                     this_block_bytes = bytes_left_in_block
+
+                    XCPFlash.print_progress_bar(iteration, block_count, 'flashing')
+                    iteration += 1
 
                 msg_bytes = min(bytes_left_in_block, bytes_per_message)
                 msg.data[1] = bytes_left_in_block
@@ -377,9 +382,13 @@ class XCPFlash:
                             raise ConnectionError(f'PROGRAM failed with error code: 0x{response.data[1]:02x}')
 
 
+
+
                 # wait
                 if self._min_separation_time_us > 0:
                     time.sleep(self._min_separation_time_us * 1e-6)
+
+            XCPFlash.print_progress_bar(block_count, block_count, 'flashing')
 
         else:
             raise NotImplementedError('PROGRAM path not implemented')
@@ -391,6 +400,8 @@ class XCPFlash:
                 msg.data[data_offset_start:data_offset_start + bytes_per_message] = data[offset:offset + bytes_per_message]
                 offset += bytes_per_message
                 self.send_can_msg(msg)
+
+
 
 
     def _sync_or_die(self):
@@ -745,6 +756,8 @@ class XCPFlash:
 
 
 if __name__ == "__main__":
+    import argparse
+
     # select a sensible default value for the interface/channel
     default_interface = ""
     default_channel = ""
