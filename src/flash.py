@@ -195,7 +195,7 @@ class XCPFlash:
         value &= 0xffffffff # ensure 32 bit
         i0 = (value >> 24) & 0xff
         i1 = (value >> 16) & 0xff
-        i2 = (value >> 0) & 0xff
+        i2 = (value >> 8) & 0xff
         i3 = value & 0xff
         return i0 | (i1 << 8) | (i2 << 16) | (i3 << 24)
 
