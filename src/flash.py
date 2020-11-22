@@ -1,10 +1,9 @@
-# SPDX-License-Identifier: GPL-3.0
+#!/usr/bin/env python3
 
+# SPDX-License-Identifier: GPL-3.0
 # Copyright (C) 2020 Christian Wressnegger <c.wressnegger@tu-bs.de>
 # Copyright (C) 2020 Jean Gressmann <jean@0x42.de>
 
-
-#!/usr/bin/env python3
 
 from enum import Enum
 import argparse
